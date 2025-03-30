@@ -7,7 +7,9 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 )
@@ -115,10 +117,12 @@ func munge(filename string) (columns []string, entries []map[string]string, err 
 			return
 		case sel.Is("table.sw-datatable"):
 			headerText := sel.Find("th.newReportTitleStyle").First().Text()
-			if !strings.Contains(headerText, "Release") {
+			isRelease := strings.Contains(headerText, "Release")
+			isWithdrawal := strings.Contains(headerText, "Withdrawal on")
+			if !isRelease && !isWithdrawal {
 				return
 			}
-			// if it does contain that word, it's relevant: continue...
+			// if it contains either word, it's relevant: continue...
 		default:
 			panic("unreachable, earlier filter should not have matched this")
 		}
@@ -132,7 +136,15 @@ func munge(filename string) (columns []string, entries []map[string]string, err 
 
 		// Pick a title for the event.
 		//  We'll use that same table header that we happened to already look at above to filter the tables in the first place.
-		accumulate(&columns, row, "Event", strings.TrimSpace(sel.Find("th.newReportTitleStyle").First().Text()))
+		headerText := strings.TrimSpace(sel.Find("th.newReportTitleStyle").First().Text())
+		accumulate(&columns, row, "Event", headerText)
+
+		// Add the Type column
+		if strings.Contains(headerText, "Release") {
+			accumulate(&columns, row, "Type", "Buy")
+		} else if strings.Contains(headerText, "Withdrawal on") {
+			accumulate(&columns, row, "Type", "Sell")
+		}
 
 		// Some brain genius made a four-column layout: two columns of two paired columns.  KVKV.
 		// So we get to suss that back out.  Neato.
@@ -161,32 +173,153 @@ func munge(filename string) (columns []string, entries []map[string]string, err 
 			accumulate(&columns, row, col3[i], col4[i])
 		}
 
-		// For shits and giggles, they also made another KV attachment section, in a slightly different format.
-		//  This one is at least only KV.  And fortunately we can distinguish it by the classes of the table cells.
-		// TODO I haven't parsed this yet.
-		/*
-			// Code below is Not quite it.  The data is actually in another table that's a sibling *down* from the curren table.
-			// This is such an obscenely terrible way to parse this that *I give up*.  I'm done here.
-			// Fortunately, in my report, all the data found in this area is auxillary and can be regenerated from the data found in the earlier mechanism.
-			sel.Find("tr").Each(func(i int, sel *goquery.Selection) {
-				var key string
-				ugh, _ := sel.Html()
-				sel.Find("td.newReportCellStyle").Each(func(i int, sel *goquery.Selection) {
-					switch i {
-					case 0:
-						key = strings.TrimSpace(sel.Text())
-					case 1:
-						accumulate(&columns, row, key, strings.TrimSpace(sel.Text()))
+		// Process additional tables that follow the main table
+		if strings.Contains(headerText, "Release") {
+			// For releases, find and process the "Value of Shares Sold" table that follows
+			nextTable := sel.Next()
+			if nextTable.Length() > 0 && nextTable.Is("table.sw-datatable") {
+				// Check if it's a "Value of Shares Sold" table
+				headerText := nextTable.Find("th.newReportHeadingStyle").First().Text()
+				if strings.TrimSpace(headerText) == "Value of Shares Sold" {
+					processValueTable(nextTable, &columns, row)
+
+					// Get the total value from the next table
+					totalTable := nextTable.Next()
+					if totalTable.Length() > 0 && totalTable.Is("table.sw-datatable") {
+						totalText := totalTable.Find("td.defaultTableModelTextBold").First().Text()
+						if strings.HasPrefix(totalText, "Total Value:") {
+							accumulate(&columns, row, "Total Value", strings.TrimSpace(strings.TrimPrefix(totalText, "Total Value:")))
+						}
 					}
-				})
-			})
-		*/
+				}
+			}
+		} else if strings.Contains(headerText, "Withdrawal on") {
+			// For withdrawals, process all the following tables until we hit a non-relevant one
+			currentTable := sel.Next()
+			for currentTable.Length() > 0 {
+				if !currentTable.Is("table.sw-datatable") {
+					break
+				}
+
+				headerText := currentTable.Find("th.newReportHeadingStyle, th.newReportTitleStyle").First().Text()
+				if headerText == "" {
+					currentTable = currentTable.Next()
+					continue
+				}
+				headerText = strings.TrimSpace(headerText)
+
+				// Process tables based on their headers
+				switch headerText {
+				case "Sale Breakdown", "Electronic Share Transfer", "Mail cash to broker", "Net Proceeds":
+					processValueTable(currentTable, &columns, row)
+
+					// Check for total value table
+					totalTable := currentTable.Next()
+					if totalTable.Length() > 0 && totalTable.Is("table.sw-datatable") {
+						totalText := totalTable.Find("td.defaultTableModelTextBold").First().Text()
+						if strings.HasPrefix(totalText, "Total Value:") {
+							accumulate(&columns, row, headerText+" Total", strings.TrimSpace(strings.TrimPrefix(totalText, "Total Value:")))
+							currentTable = totalTable.Next()
+							continue
+						}
+					}
+				}
+				currentTable = currentTable.Next()
+			}
+		}
+	})
+
+	// Sort entries by Settlement Date
+	sort.Slice(entries, func(i, j int) bool {
+		date1, ok1 := entries[i]["Settlement Date"]
+		date2, ok2 := entries[j]["Settlement Date"]
+
+		// If either entry doesn't have a Settlement Date, keep original order
+		if !ok1 || !ok2 {
+			return false
+		}
+
+		// Parse dates in the format "02-Jan-2006"
+		t1, err1 := time.Parse("02-Jan-2006", date1)
+		if err1 != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Could not parse date %q: %v\n", date1, err1)
+			return false
+		}
+		t2, err2 := time.Parse("02-Jan-2006", date2)
+		if err2 != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Could not parse date %q: %v\n", date2, err2)
+			return false
+		}
+		return t1.Before(t2)
 	})
 
 	return columns, entries, nil
 }
 
+// Helper function to process value tables (used for both Release and Withdrawal tables)
+func processValueTable(table *goquery.Selection, columns *[]string, row map[string]string) {
+	table.Find("tr").Each(func(i int, tr *goquery.Selection) {
+		// Skip the header row
+		if i == 0 {
+			return
+		}
+
+		// Get the key and value from the cells
+		var key, value string
+		tr.Find("td.newReportCellStyle").Each(func(j int, td *goquery.Selection) {
+			text := strings.TrimSpace(td.Text())
+			if j == 0 {
+				key = text
+			} else if j == 1 {
+				value = text
+			}
+		})
+		if key != "" && value != "" {
+			accumulate(columns, row, key, value)
+		}
+	})
+}
+
+func normalizeColumnName(originalName, eventType string) string {
+	switch {
+	case eventType == "Buy" && originalName == "Number of Restricted Awards Disbursed:":
+		return "stocks report"
+	case eventType == "Sell" && originalName == "Shares Sold:":
+		return "stocks report"
+	case eventType == "Buy" && originalName == "Release Price:":
+		return "price per unit"
+	case eventType == "Sell" && originalName == "Market Price Per Unit:":
+		return "price per unit"
+	default:
+		return originalName
+	}
+}
+
 func accumulate(columnOrder *[]string, row map[string]string, key string, value string) {
+	// Get the event type from the row
+	eventType := row["Type"]
+
+	// Normalize the column name
+	normalizedKey := normalizeColumnName(key, eventType)
+
+	// If the key was normalized, we need to handle both the normalized and original names
+	if normalizedKey != key {
+		row[normalizedKey] = value
+		// Check if we need to add the normalized column name
+		found := false
+		for _, col := range *columnOrder {
+			if col == normalizedKey {
+				found = true
+				break
+			}
+		}
+		if !found {
+			*columnOrder = append(*columnOrder, normalizedKey)
+		}
+		return
+	}
+
+	// Original accumulate logic for non-normalized keys
 	row[key] = value
 	for _, col := range *columnOrder {
 		if col == key {
