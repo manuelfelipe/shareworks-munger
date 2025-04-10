@@ -231,8 +231,8 @@ func munge(filename string) (columns []string, entries []map[string]string, err 
 
 	// Sort entries by Settlement Date
 	sort.Slice(entries, func(i, j int) bool {
-		date1, ok1 := entries[i]["Settlement Date"]
-		date2, ok2 := entries[j]["Settlement Date"]
+		date1, ok1 := entries[i]["Settlement Date:"]
+		date2, ok2 := entries[j]["Settlement Date:"]
 
 		// If either entry doesn't have a Settlement Date, keep original order
 		if !ok1 || !ok2 {
